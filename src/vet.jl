@@ -276,8 +276,9 @@ function vet_operation(msg)
     elseif op=="replay_stream"
         request=from_dict(Request, msg["canonical_request"])
         raw=StreamEvent[]
+        reader=stream_reader(l, request)
         parse_sse(IOBuffer(base64decode(msg["body_b64"]))) do frame
-            return append!(raw, parse_stream_events(l, request, frame))
+            return append!(raw, feed!(reader, frame))
         end
         events=collect(coalesce_stream(raw; model=request.model))
         trace=to_dict.(events)

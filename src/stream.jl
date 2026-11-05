@@ -250,9 +250,10 @@ function stream(l::ProviderLM, r::Request)
                     )
                 end
                 http=nothing
+                reader=stream_reader(l, r)
                 try
                     parse_sse(io) do frame
-                        for event in parse_stream_events(l, r, frame)
+                        for event in feed!(reader, frame)
                             if event isa StreamErrorEvent
                                 # Handshake evidence on an in-stream error (docs/error-diagnostics.md).
                                 http===nothing && (http=stream_http_response(head.headers))
@@ -287,6 +288,233 @@ function parse_stream_events(l, r, frame::SSEEvent)
     return gemini_stream_frame(l, r, d)
 end
 deltaevent(d::Delta) = StreamDeltaEvent(; delta=d)
+
+# ─── Stream readers (MAP-20) ──────────────────────────────────────────
+#
+# `parse_stream_events` maps ONE frame on its own and holds no state. A
+# reader reads one stream: it may hold what that stream needs and nothing
+# across streams. Every path that turns frames into canonical events goes
+# through `stream_reader` (the stream and the vet shim).
+
+abstract type StreamReader end
+
+struct StatelessStreamReader <: StreamReader
+    lm::Any
+    request::Request
+end
+feed!(s::StatelessStreamReader, frame::SSEEvent) = parse_stream_events(s.lm, s.request, frame)
+
+"""
+    stream_reader(lm, request) -> StreamReader
+
+The reader for one stream of `request` (MAP-20): OpenAI Responses completes
+each item's fragments from its final copy; Gemini gives each part its slot
+across chunks; the other dialects map each frame on its own.
+"""
+function stream_reader(l, r::Request)
+    l.dialect=="openai-responses" && return ResponsesStreamReader(l, r)
+    l.dialect=="gemini" && return GeminiStreamReader(l, r)
+    return StatelessStreamReader(l, r)
+end
+
+"""
+What one stream's fragments delivered, per part slot and channel. A final
+copy is the provider restating a value it may also have sent in fragments;
+`remainder!` is what the fragments did not deliver: the whole value when
+none came, the rest when they are its beginning, nothing when they are all
+of it. Fragments that are not its beginning contradict it and the stream is
+refused: lm15 does not choose.
+"""
+struct FinalCopies
+    seen::Dict{Tuple{Int,String},String}
+end
+FinalCopies() = FinalCopies(Dict{Tuple{Int,String},String}())
+function saw!(f::FinalCopies, index::Integer, channel::String, text::AbstractString)
+    isempty(text) && return nothing
+    key=(Int(index), channel)
+    f.seen[key]=get(f.seen, key, "")*text
+    return nothing
+end
+function remainder!(f::FinalCopies, index::Integer, channel::String, final::AbstractString; json_value::Bool=false)
+    key=(Int(index), channel)
+    got=get(f.seen, key, "")
+    if startswith(final, got)
+        f.seen[key]=String(final)
+        return String(codeunits(final)[(ncodeunits(got) + 1):end])
+    end
+    # The same JSON value, members in the same order: the text differs
+    # (whitespace, escapes), the arguments do not.
+    json_value && same_json(got, final) && return ""
+    throw(
+        StreamAssemblyError(
+            "the streamed $channel of part $index is not the beginning of the provider's final copy of it " *
+            "($(ncodeunits(got)) bytes streamed, $(ncodeunits(final)) in the final copy); lm15 does not choose " *
+            "between them (MAP-20)";
+            part_index=Int(index),
+        ),
+    )
+end
+function same_json(a::AbstractString, b::AbstractString)
+    try
+        return JSON.serialize(JSON.parse(a)) == JSON.serialize(JSON.parse(b))
+    catch
+        return false
+    end
+end
+arguments_text(x) = x===nothing ? "" : x isa AbstractString ? String(x) : JSON.serialize(x)
+function message_final_text(item)
+    out=IOBuffer()
+    for c in getarray(item, "content")
+        c isa AbstractDict || continue
+        tag=get(c, "type", nothing)
+        if tag in ("output_text", "text")
+            print(out, wire_string(get(c, "text", nothing)))
+        elseif tag=="refusal"
+            print(out, wire_string(first_nonempty(get(c, "refusal", nothing), get(c, "text", nothing))))
+        end
+    end
+    return String(take!(out))
+end
+
+"""
+One OpenAI Responses stream (MAP-20). `response.output_item.done` is each
+item's final copy; at it the reader emits what the item's fragments did not
+deliver: a function call's arguments (the Codex backend sends parallel
+calls' arguments only there), a message's text, a reasoning item's summary.
+A summary's parts are joined with a newline, as the complete path joins
+them (INV-051); the newline goes before the first fragment of each later part.
+"""
+struct ResponsesStreamReader <: StreamReader
+    lm::Any
+    request::Request
+    copies::FinalCopies
+    summary_part::Dict{Int,Int}
+    named::Set{Int}
+end
+ResponsesStreamReader(l, r) = ResponsesStreamReader(l, r, FinalCopies(), Dict{Int,Int}(), Set{Int}())
+
+function feed!(s::ResponsesStreamReader, frame::SSEEvent)
+    events=parse_stream_events(s.lm, s.request, frame)
+    (isempty(frame.data) || frame.data=="[DONE]") && return events
+    d=JSON.parse(frame.data)
+    d isa AbstractDict || return events
+    type=get(d, "type", nothing)
+    i=Int(get(d, "output_index", 0))
+    if type=="response.reasoning_summary_text.delta"
+        part=Int(get(d, "summary_index", 0))
+        at=get(s.summary_part, i, 0)
+        prefix=""
+        if part > at
+            s.summary_part[i]=part
+            prefix="\n"^(part - at)
+        end
+        for (k, e) in enumerate(events)
+            if e isa StreamDeltaEvent && e.delta isa ThinkingDelta
+                text=prefix*e.delta.text
+                events[k]=deltaevent(reconstruct(e.delta; text))
+                saw!(s.copies, i, "summary", text)
+            end
+        end
+    elseif type in ("response.output_text.delta", "response.refusal.delta")
+        saw!(s.copies, i, "text", wire_string(get(d, "delta", nothing)))
+    elseif type in ("response.output_item.added", "response.function_call_arguments.delta")
+        for e in events
+            if e isa StreamDeltaEvent && e.delta isa ToolCallDelta
+                saw!(s.copies, i, "arguments", e.delta.input)
+                e.delta.name===nothing || push!(s.named, i)
+            end
+        end
+    elseif type=="response.output_item.done" && get(d, "item", nothing) isa AbstractDict
+        events=vcat(complete_item!(s, i, d["item"]), events)
+    end
+    return events
+end
+
+function complete_item!(s::ResponsesStreamReader, i::Int, item)
+    tag=get(item, "type", nothing)
+    if tag=="function_call"
+        rest=remainder!(s.copies, i, "arguments", arguments_text(get(item, "arguments", nothing)); json_value=true)
+        isempty(rest) && i in s.named && return StreamEvent[]
+        name=string_field(item, "name")
+        name===nothing || push!(s.named, i)
+        return StreamEvent[deltaevent(
+            ToolCallDelta(;
+                input=rest,
+                part_index=i,
+                id=first_nonempty(string_field(item, "call_id"), string_field(item, "id")),
+                name,
+            ),
+        )]
+    elseif tag=="message"
+        rest=remainder!(s.copies, i, "text", message_final_text(item))
+        return isempty(rest) ? StreamEvent[] : StreamEvent[deltaevent(TextDelta(; text=rest, part_index=i))]
+    elseif tag=="reasoning" && get(item, "summary", nothing) isa AbstractVector
+        texts=[x isa AbstractDict ? wire_string(get(x, "text", nothing)) : wire_string(x) for x in item["summary"]]
+        rest=remainder!(s.copies, i, "summary", join(texts, "\n"))
+        return isempty(rest) ? StreamEvent[] : StreamEvent[deltaevent(ThinkingDelta(; text=rest, part_index=i))]
+    end
+    return StreamEvent[]
+end
+
+"""
+One Gemini stream: which slot each chunk's parts belong to. A chunk's parts
+are numbered from 0 in every chunk. The first part of a chunk continues the
+previous chunk's last part when both are text (or both thought text): that
+is how a long text arrives. Every other part is a new part with a slot of
+its own, in arrival order. A function call is never a continuation:
+gemini-2.5-pro sends each parallel call in a chunk of its own
+(cases/gemini/streaming_parallel_tool_calls_chunked.json).
+"""
+mutable struct GeminiStreamReader <: StreamReader
+    lm::Any
+    request::Request
+    last_slot::Int
+    last_kind::String
+    next::Int
+end
+GeminiStreamReader(l, r) = GeminiStreamReader(l, r, 0, "", 0)
+
+function gemini_part_kind(p)
+    p isa AbstractDict || return ""
+    haskey(p, "text") && return get(p, "thought", false)===true ? "thought" : "text"
+    get(p, "functionCall", nothing) isa AbstractDict && return "call"
+    get(p, "inlineData", nothing) isa AbstractDict && return "media"
+    return ""
+end
+
+function feed!(s::GeminiStreamReader, frame::SSEEvent)
+    events=parse_stream_events(s.lm, s.request, frame)
+    isempty(frame.data) && return events
+    d=try
+        JSON.parse(frame.data)
+    catch
+        return events
+    end
+    d isa AbstractDict || return events
+    cands=getarray(d, "candidates")
+    parts=isempty(cands) || !(cands[1] isa AbstractDict) ? Any[] : getarray(getobject(cands[1], "content"), "parts")
+    slots=Dict{Int,Int}()
+    for (pos, p) in enumerate(parts)
+        kind=gemini_part_kind(p)
+        isempty(kind) && continue
+        idx=pos-1
+        if idx==0 && kind in ("text", "thought") && s.last_kind==kind
+            slot=s.last_slot
+        else
+            slot=s.next
+            s.next+=1
+        end
+        slots[idx]=slot
+        s.last_slot, s.last_kind=slot, kind
+    end
+    for (k, e) in enumerate(events)
+        e isa StreamDeltaEvent || continue
+        index=e.delta.part_index
+        (index===nothing || !haskey(slots, index) || slots[index]==index) && continue
+        events[k]=deltaevent(reconstruct(e.delta; part_index=slots[index]))
+    end
+    return events
+end
 function frame_error(l, d)
     inner=getobject(d, "error")
     code=wire_string(

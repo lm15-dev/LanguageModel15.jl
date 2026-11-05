@@ -8,6 +8,9 @@ generation 2 (MAP-19) is the first Julia publishes. A new package may start at `
 Checked at contract `cfc3edc`: `Pkg.test()` and the contract, 1,968 of 1,968. The 1.0.0
 registration of the same commit (JuliaRegistries/General#174330) was superseded.
 
+2.1.0 (2026-11-05) checked at contract `77f22f4` (MAP-20, a stream's final copy completes
+its fragments): `Pkg.test()` and the contract, 2,132 of 2,132.
+
 The entries below record how the never-registered 1.0.0 was checked.
 
 Re-checked 2026-10-15 at contract `6dc1c5c`, when the pending registration moved to the

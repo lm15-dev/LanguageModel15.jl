@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.1.0 — 2026-11-05
+
+Streams yield what the provider said, all of it, once (lm15-contract `77f22f4`, MAP-20;
+2,132 of 2,132 checks, the same as every lm15 language). Nothing is removed and no field
+changes meaning.
+
+- **Parallel tool calls on the Codex subscription arrive with their inputs.** The Codex
+  backend sends the arguments of parallel calls only in each call's final
+  `response.output_item.done`, never in pieces; every call came back with input `{}`. A
+  stream's final copy of an item now completes whatever its pieces did not deliver
+  (arguments, message text, a reasoning summary); a piece that contradicts the final copy
+  throws `StreamAssemblyError` (`stream_assembly`, `part_index` set) instead of either
+  value being chosen.
+- **A streamed reasoning summary reads like the complete one:** its parts are joined with a
+  newline; they used to run together.
+- **Gemini parallel calls sent one per chunk stay separate calls.** gemini-2.5-pro and
+  gemini-3-flash-preview send each call in a chunk of its own; every call landed in the
+  same slot and their arguments ran into one unreadable input.
+- `stream_reader(lm, request)` and `feed!(reader, frame)` read one stream (internal, not
+  exported); `stream` and the vet shim go through them. (`response.incomplete` already
+  ended a Julia stream with `length`.)
+
 ## 2.0.0 — 2026-11-01
 
 The first release of lm15 for Julia, as the package **`LanguageModel15`** (`using
