@@ -695,7 +695,7 @@ function anthropic_payload(l, r; stream=false)
             adapt!("config.reasoning.effort", "clamped", "this server has no '$(effort)' level (it accepts $(join(c.reasoning_efforts, ", "))) and would have accepted the word silently"; asked=effort, applied=nearest)
             effort=nearest
         end
-        reasoning.summary in ("concise", "detailed") && adapt!("config.reasoning.summary", "substituted", "the Messages API has no summary detail levels; it returns thinking blocks whenever thinking runs, which is 'auto'"; asked=reasoning.summary, applied="auto")
+        reasoning.summary in ("concise", "detailed") && adapt!("config.reasoning.summary", "substituted", "the Messages API has no summary detail levels; it returns one summary of the thinking, which is 'auto'"; asked=reasoning.summary, applied="auto")
         if adaptive
             if thinking_budget!==nothing
                 adapt!("config.reasoning.thinking_budget", "dropped",
@@ -809,6 +809,13 @@ function anthropic_payload(l, r; stream=false)
             d["output_config"]=obj("effort"=>effort)
         else
             d["thinking"]=obj("type"=>"enabled", "budget_tokens"=>budget)
+        end
+        # MAP-7 rule 7 (amended 2026-11-07): the thinking is shown only when asked on Opus 4.7, 4.8 and every
+        # Claude 5 (display defaults to "omitted": a thinking block with empty text); every Claude model accepts
+        # "summarized" (live 2026-11-07, 14 models).
+        if c.thinking_format=="anthropic" && reasoning.summary!==nothing && haskey(d, "thinking") &&
+                d["thinking"]["type"] in ("adaptive", "enabled")
+            d["thinking"]["display"]="summarized"
         end
     end
     if config.response_format!==nothing

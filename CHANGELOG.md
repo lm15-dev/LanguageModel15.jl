@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.2.0 — 2026-11-07
+
+Claude shows its thinking when you ask for it (lm15-contract `9d8e1ce`, MAP-7 rule 7
+amended; 2,140 of 2,140 checks, the same as every lm15 language).
+
+- **`Reasoning(; summary=...)` on Claude sends `thinking.display: "summarized"`.** Since
+  Opus 4.7, Anthropic returns a thinking block with empty text unless the request asks for
+  the summary: on Opus 4.7, Opus 4.8 and every Claude 5 model, `summary="auto"` gave an
+  empty thinking part (live on 14 models). Any `summary` now adds the knob, with adaptive
+  thinking and with a budget alike; every Claude model accepts it. Without `summary`
+  nothing changes. DeepSeek, Meta and Moonshot over the Messages wire are unchanged.
+
 ## 2.1.0 — 2026-11-05
 
 Streams yield what the provider said, all of it, once (lm15-contract `77f22f4`, MAP-20;

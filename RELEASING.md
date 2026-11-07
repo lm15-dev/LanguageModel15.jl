@@ -11,6 +11,9 @@ registration of the same commit (JuliaRegistries/General#174330) was superseded.
 2.1.0 (2026-11-05) checked at contract `77f22f4` (MAP-20, a stream's final copy completes
 its fragments): `Pkg.test()` and the contract, 2,132 of 2,132.
 
+2.2.0 (2026-11-07) checked at contract `9d8e1ce` (MAP-7 rule 7 amended: Claude's thinking
+display): `Pkg.test()` and the contract, 2,140 of 2,140.
+
 The entries below record how the never-registered 1.0.0 was checked.
 
 Re-checked 2026-10-15 at contract `6dc1c5c`, when the pending registration moved to the
