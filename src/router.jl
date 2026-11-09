@@ -64,6 +64,11 @@ Base.@kwdef struct RouterConfig
     auth::Any = nothing
     transport::Any = nothing
     adaptations::String = "note"
+    # A fine-tune's base model, by model id (`"tinker://…" => "Qwen/Qwen3.5-4B"`): a
+    # provider's per-model rules (a compat preset's model_overrides) match the model id
+    # first, then its base model's. Never sent; never discovered — the provider's
+    # catalog states it (`ModelInfo.origin.base_model`).
+    base_models::AbstractDict = Dict{String,String}()
 end
 function Base.show(io::IO, ::RouterConfig)
     return print(io, "RouterConfig(<credentials and environment withheld>)")
@@ -117,13 +122,28 @@ function table_provider(table, name)
     end
     return nothing
 end
+"""The registry provider an alias names (a registry entry's aliases route like its id;
+2026-11-09: `thinkingmachines` names `tinker`), or `nothing`."""
+function registry_alias(name)
+    for d in values(PROVIDERS)
+        name in d.aliases && return d.id
+    end
+    return nothing
+end
+"""A model string whose first ':' is followed by "//": a URI (`tinker://…`), one name,
+never `provider:model` (2026-11-09)."""
+function is_uri(model::AbstractString)
+    bits=split(model, ':'; limit=2)
+    return length(bits)==2 && !isempty(bits[1]) && startswith(bits[2], "//")
+end
 function check_declared(providers)
     providers isa Tuple && all(d -> d isa ProviderDefinition, providers) ||
         throw(ArgumentError("RouterConfig(providers=...) takes a tuple of ProviderDefinition"))
     litellm = Set(keys(LITELLM_PROVIDER_PREFIXES))
     taken = Dict{String,String}()
     for d in providers, spelling in spellings(d)
-        built_in = haskey(PROVIDERS, spelling) ? PROVIDERS[spelling].id : (spelling in litellm ? LITELLM_PROVIDER_PREFIXES[spelling] : nothing)
+        built_in = haskey(PROVIDERS, spelling) ? PROVIDERS[spelling].id :
+            something(registry_alias(spelling), spelling in litellm ? LITELLM_PROVIDER_PREFIXES[spelling] : nothing, Some(nothing))
         built_in === nothing || throw(NotConfiguredError(
             "RouterConfig(providers=...): $(repr(spelling)) already names lm15's $(repr(built_in)) door; a declared provider takes a new id and aliases"))
         haskey(taken, spelling) && throw(NotConfiguredError(
@@ -160,6 +180,9 @@ mutable struct LMRouter
 end
 function LMRouter(config::RouterConfig=RouterConfig())
     check_declared(config.providers)
+    all(p -> p.first isa AbstractString && !isempty(p.first) && p.second isa AbstractString &&
+        !isempty(p.second), config.base_models) ||
+        throw(ArgumentError("RouterConfig(base_models=...) maps a model id to its base model id, both non-empty strings"))
     config.auth === nothing || config.auth isa Auth || throw(ArgumentError("RouterConfig(auth=...) takes an Auth"))
     table = provider_table(config)
     for (label, mapping) in (
@@ -193,7 +216,7 @@ function resolve(router::LMRouter, model::AbstractString)
     isempty(requested) && throw(UnknownModelError("model must not be empty"; model=requested))
     table=provider_table(router.config)
     bits=split(requested, ':'; limit=2)
-    if length(bits)==2 && !isempty(bits[2])
+    if length(bits)==2 && !isempty(bits[2]) && !is_uri(requested)
         provider=table_provider(table, bits[1])
         provider===nothing || return Resolution(;
             requested, model=String(bits[2]), provider, source="prefix", declared=!haskey(PROVIDERS, provider))
@@ -290,6 +313,7 @@ function build_lm(router::LMRouter, provider)
         transport=config.transport,
         adaptations=config.adaptations,
         credential=provider_setting(config.credentials, provider),
+        base_models=Dict{String,String}(String(k)=>String(v) for (k, v) in config.base_models),
     )
 end
 """AUTH-15 mode B: the explicit api_keys entry; an explicit named cloud identity; the
@@ -367,6 +391,7 @@ function managed_lm(router::LMRouter, provider)
         credential=named,
         account_id,
         credential_origin=origin,
+        base_models=Dict{String,String}(String(k)=>String(v) for (k, v) in config.base_models),
     )
 end
 function complete(router::LMRouter, request::Request)
@@ -384,6 +409,7 @@ function plan(router::LMRouter, request::Request; stream=false)
         definition=provider_table(router.config)[resolution.provider]
         ProviderLM(haskey(PROVIDERS, resolution.provider) ? resolution.provider : definition;
             api_key="unused: plan sends nothing", adaptations=router.config.adaptations,
+            base_models=Dict{String,String}(String(k)=>String(v) for (k, v) in router.config.base_models),
             account_id=definition.access.backend=="chatgpt-codex" ? "planning" : nothing)
     end
     return plan(client, reconstruct(request; model=resolution.model); stream)

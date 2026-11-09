@@ -21,6 +21,9 @@ Base.@kwdef struct OpenAIChatCompat <: Compat
     # (the dialect's rule): completion_tokens already includes it.
     # "separate": counted beside the completion (xAI), so output is their sum.
     reasoning_usage::Maybe{String} = nothing
+    # MAP-22: "included" when the server returns the stop sequence it stopped
+    # at (Tinker); lm15 cuts it where replies become canonical.
+    stop_in_text::Maybe{String} = nothing
     reasoning_efforts::Maybe{Tuple} = nothing
     routing::Maybe{JsonObject} = nothing
     extensions::Maybe{JsonObject} = nothing
@@ -49,6 +52,7 @@ Base.@kwdef struct AnthropicCompat <: Compat
     sampling_params::Maybe{String} = nothing
     tool_result_media::Maybe{String} = nothing
     reasoning_efforts::Maybe{Tuple} = nothing
+    stop_in_text::Maybe{String} = nothing
     model_prefixes::Maybe{Tuple} = nothing
     extensions::Maybe{JsonObject} = nothing
 end
@@ -111,6 +115,7 @@ const CHAT_DEFAULTS = (
     json_schema="send",
     token_scoring="none",
     reasoning_usage="in_completion",
+    stop_in_text="excluded",
 )
 const RESPONSES_DEFAULTS = (
     developer_role="developer",
@@ -132,6 +137,7 @@ const ANTHROPIC_DEFAULTS = (
     parallel_tool_calls="send",
     sampling_params="send",
     tool_result_media="native",
+    stop_in_text="excluded",
 )
 const COMPAT_VALUES=Dict(
     :instruction_role=>("developer", "system"),
@@ -147,10 +153,11 @@ const COMPAT_VALUES=Dict(
     :cache_control=>("none", "openai", "openai_implicit", "anthropic"),
     :user_field=>("user", "user_id", "safety_identifier"),
     :forced_tool_choice=>("send", "reject"),
-    :reasoning_off=>("send", "lowest"),
+    :reasoning_off=>("send", "lowest", "switch"),
+    :stop_in_text=>("excluded", "included"),
     :reasoning_usage=>("in_completion", "separate"),
     :token_scoring=>("none", "logprob_token_ids"),
-    :json_schema=>("send", "reject"),
+    :json_schema=>("send", "reject", "none"),
     :structured_output=>("send", "reject"),
     :parallel_tool_calls=>("send", "reject"),
     :sampling_params=>("send", "reject"),
@@ -186,6 +193,7 @@ function validate(c::Compat)
                     "kimi",
                     "qwen",
                     "qwen_chat_template",
+                    "reasoning_effort_switch",
                 )
             end
         elseif name===:thinking_replay
@@ -229,6 +237,7 @@ function validate(c::Compat)
                     "tool_result_media",
                     "reasoning_off",
                     "reasoning_usage",
+                    "stop_in_text",
                 )
                 all(k -> k in allowed_knobs, keys(knobs)) ||
                     throw(ArgumentError("unknown per-model compatibility setting"))
@@ -238,14 +247,22 @@ function validate(c::Compat)
     end
     return c
 end
-function resolved_compat(c::Compat, model=""; override=nothing)
+function resolved_compat(c::Compat, model=""; override=nothing, base_model=nothing)
     validate(c)
     d = Dict{Symbol,Any}(n=>getfield(c, n) for n in fieldnames(typeof(c)))
     if c isa OpenAIChatCompat
-        for (prefix, knobs) in c.model_overrides
-            startswith(model, prefix) || continue
-            merge!(d, Dict(Symbol(k)=>v for (k, v) in knobs))
-            break
+        # A fine-tune whose id matches no entry follows its declared base
+        # model's entry (RouterConfig base_models, 2026-11-09).
+        names = base_model === nothing ? (model,) : (model, base_model)
+        matched = false
+        for name in names
+            for (prefix, knobs) in c.model_overrides
+                startswith(name, prefix) || continue
+                merge!(d, Dict(Symbol(k)=>v for (k, v) in knobs))
+                matched = true
+                break
+            end
+            matched && break
         end
     end
     if override !== nothing

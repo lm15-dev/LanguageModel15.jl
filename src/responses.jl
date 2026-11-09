@@ -70,10 +70,12 @@ const MODEL_NOT_FOUND_FORMS=Tuple(
     form in JSON.parse(read(joinpath(@__DIR__, "data", "model_not_found.json"), String))
 )
 function pinned_model_not_found(code, message)
-    (code isa AbstractString && !isempty(code)) || return false
+    # A form whose code is null matches an error that carries none (MAP-21
+    # detail bodies, 2026-11-09).
+    code=(code isa AbstractString && !isempty(code)) ? code : nothing
     text=message isa AbstractString ? message : ""
     return any(MODEL_NOT_FOUND_FORMS) do f
-        f.code==code &&
+        isequal(f.code, code) &&
             (!haskey(f, :prefix) || startswith(text, f.prefix)) &&
             (!haskey(f, :contains) || occursin(f.contains, text)) &&
             (!haskey(f, :suffix) || endswith(text, f.suffix))
@@ -130,6 +132,38 @@ function context_error(message)
         any(s->occursin(s, lowercase(message)), ("limit", "exceed"))
     )
 end
+"""MAP-21: the message of an error body in FastAPI's shape, which has no `error`
+envelope: `{"detail": "<text>"}` (optionally with `errors`, a list of `{loc, msg}`), or
+`{"detail": [{loc, msg}]}`. An entry reads `<loc>: <msg>` (a list `loc` joined with
+" -> "); entries join with "; " and follow the text after ": ". `nothing` when the body
+is not that shape."""
+function detail_message(data)
+    data isa AbstractDict || return nothing
+    haskey(data, "error") && return nothing
+    entries(items) = begin
+        out=String[]
+        items isa AbstractVector || return out
+        for item in items
+            item isa AbstractDict || continue
+            msg=get(item, "msg", nothing)
+            msg isa AbstractString || continue
+            loc=get(item, "loc", nothing)
+            loc isa AbstractVector && (loc=join((x isa AbstractString ? x : JSON.json(x) for x in loc), " -> "))
+            push!(out, loc isa AbstractString && !isempty(loc) ? "$(loc): $(msg)" : String(msg))
+        end
+        out
+    end
+    detail=get(data, "detail", nothing)
+    if detail isa AbstractString && !isempty(strip(detail))
+        found=entries(get(data, "errors", nothing))
+        head=String(strip(detail))
+        return isempty(found) ? head : head * ": " * join(found, "; ")
+    elseif detail isa AbstractVector
+        found=entries(detail)
+        return isempty(found) ? nothing : join(found, "; ")
+    end
+    return nothing
+end
 function normalize_error(l::ProviderLM, status, body)
     l.dialect=="typesafe" && return typesafe_error(l, status, body)
     data=try
@@ -146,6 +180,8 @@ function normalize_error(l::ProviderLM, status, body)
     T=nothing
     if l.dialect in ("openai-responses", "openai-chat")
         message=raw isa AbstractString ? String(raw) : wire_string(get(inner, "message", ""))
+        # MAP-21: FastAPI servers (Tinker) answer {"detail": ...} with no envelope.
+        isempty(message) && (message=something(detail_message(data), ""))
         code=wire_string(
             first_nonempty(
                 get(inner, "code", nothing),
@@ -174,6 +210,8 @@ function normalize_error(l::ProviderLM, status, body)
     elseif l.dialect=="anthropic"
         isempty(inner) && (inner=data)
         message=raw isa AbstractString ? raw : wire_string(get(inner, "message", ""))
+        # MAP-21: FastAPI's {"detail": ...} (Tinker's Messages door, 401 and 404).
+        isempty(message) && (message=something(detail_message(data), ""))
         # AUTH-10 backend settings: the minimum-version refusal names the setting to change.
         l.access.backend=="claude-code" && (message=claude_code_version_guidance(message))
         code=wire_string(first_nonempty(get(inner, "type", nothing), get(inner, "code", nothing)))
@@ -976,6 +1014,11 @@ function parse_gemini_response(l, r, d)
     )
 end
 function parse_response(l::ProviderLM, r::Request, response::HttpResponse)
+    parsed=parse_response_body(l, r, response)
+    # MAP-22: a server that returns the stop sequence it stopped at is cut here.
+    return stop_returned_in_text(l, r) ? apply_client_side_stop(parsed, r.config.stop) : parsed
+end
+function parse_response_body(l::ProviderLM, r::Request, response::HttpResponse)
     r=wire_request(l, r)
     response.status>=400 && throw(
         attach_error_metadata(

@@ -13,6 +13,10 @@ struct ProviderLM{C,T,F}
     credentials_source::Symbol
     adaptations::String
     credential_origin::Maybe{String}
+    # What each fine-tune was trained from, by model id (RouterConfig
+    # base_models, 2026-11-09): a model matching no compat model_overrides
+    # entry follows its base model's entry. Never sent; never discovered.
+    base_models::Dict{String,String}
 end
 function Base.show(io::IO, l::ProviderLM)
     return print(
@@ -60,8 +64,13 @@ function ProviderLM(
     adaptations="note",
     credential=nothing,
     credential_origin=nothing,
+    base_models=Dict{String,String}(),
 )
     adaptations=check_policy(adaptations)
+    base_models isa AbstractDict && all(p -> p.first isa AbstractString && !isempty(p.first) &&
+        p.second isa AbstractString && !isempty(p.second), base_models) ||
+        throw(ArgumentError("base_models maps a model id to its base model id, both non-empty strings"))
+    base_models = Dict{String,String}(String(k) => String(v) for (k, v) in base_models)
     named_compat = compat isa AbstractString ? compat : nothing
     definition=bound_definition(provider, access)
     policy=validate(definition.access)
@@ -255,6 +264,7 @@ function ProviderLM(
         source,
         adaptations,
         credential_origin===nothing ? origin_label(credential, source) : credential_origin,
+        base_models,
     )
 end
 """The provenance label for a credential the client was handed (AUTH-1): honest about
@@ -305,7 +315,7 @@ function effective_compat(l, request)
         )
         override===nothing || compat_from_dict(OpenAIResponsesCompat, override)
     end
-    return resolved_compat(l.compat, request.model; override)
+    return resolved_compat(l.compat, request.model; override, base_model=get(l.base_models, request.model, nothing))
 end
 function base_headers(l; request=nothing, content_type="application/json")
     headers=Dict{String,String}()
@@ -507,7 +517,10 @@ end
 other colon-bearing model id is opaque (`ollama:qwen3.5:0.8b` keeps `qwen3.5:0.8b`)."""
 function wire_request(l::ProviderLM, r::Request)
     bits=split(r.model, ':'; limit=2)
-    length(bits)==2 && !isempty(bits[2]) && canonical_provider(bits[1])==l.provider || return r
+    # A URI (`tinker://…`: the first ':' followed by "//") is one name, never a
+    # prefix (2026-11-09).
+    length(bits)==2 && !isempty(bits[2]) && !startswith(bits[2], "//") &&
+        canonical_provider(bits[1])==l.provider || return r
     return reconstruct(r; model=String(bits[2]))
 end
 function complete(l::ProviderLM, request::Request)
@@ -593,7 +606,13 @@ function parse_models_response(l::ProviderLM, r::HttpResponse)
                 id,
                 provider=l.provider,
                 api_family=family,
-                origin=ModelOrigin(; provider_data=entry),
+                # MAP-23: an entry naming the model it was trained from (Tinker's
+                # checkpoints) is a fine-tune.
+                origin=let base=get(entry, "base_model", nothing)
+                    base isa AbstractString && !isempty(base) && base != id ?
+                        ModelOrigin(; type="fine-tune", base_model=String(base), provider_data=entry) :
+                        ModelOrigin(; provider_data=entry)
+                end,
             ),
         )
     end

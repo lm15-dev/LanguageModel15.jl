@@ -69,6 +69,8 @@ function vet_adapter(msg; parse_only=false)
         settings=get(msg, "settings", Dict{String,String}()),
         clock,
         account_id=canonical_provider(provider)=="openai-codex" ? "test-account" : nothing,
+        # PROTOCOL.md base_models (2026-11-09): a fine-tune's base model.
+        base_models=Dict{String,String}(String(k)=>String(v) for (k, v) in get(msg, "base_models", Dict())),
         # The harness's own (empty) environment: nothing ambient is read.
         env=Dict{String,String}("NO_GCE_CHECK"=>"1", "HOME"=>"/nonexistent-lm15-vet-home"),
     )

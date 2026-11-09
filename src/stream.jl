@@ -314,7 +314,80 @@ across chunks; the other dialects map each frame on its own.
 function stream_reader(l, r::Request)
     l.dialect=="openai-responses" && return ResponsesStreamReader(l, r)
     l.dialect=="gemini" && return GeminiStreamReader(l, r)
-    return StatelessStreamReader(l, r)
+    reader=StatelessStreamReader(l, r)
+    # MAP-22: a server that returns the stop sequence it stopped at.
+    stop_returned_in_text(l, r) && return StopCuttingReader(reader, r.config.stop)
+    return reader
+end
+
+"""MAP-22: `Config.stop` is set and the binding's compat says the server returns the
+matched sequence in the text (`stop_in_text = "included"`)."""
+function stop_returned_in_text(l, r::Request)
+    (l isa ProviderLM && l.compat isa Union{OpenAIChatCompat,AnthropicCompat}) || return false
+    any(!isempty, r.config.stop) || return false
+    c=l.compat isa OpenAIChatCompat ? effective_compat(l, wire_request(l, r)) : resolved_compat(l.compat)
+    return c.stop_in_text=="included"
+end
+
+"""MAP-22: the reader of a server that stops at a stop sequence and returns it in the
+text. Text is cut at the first sequence; text after the cut is dropped; every other
+event (usage, the end) passes, because the server has already stopped."""
+mutable struct StopCuttingReader <: StreamReader
+    inner::StreamReader
+    stops::Vector{String}
+    held::Vector{StreamEvent}
+    cut::Bool
+end
+StopCuttingReader(inner, stop)=StopCuttingReader(inner, [String(s) for s in stop if !isempty(s)], StreamEvent[], false)
+function feed!(s::StopCuttingReader, frame::SSEEvent)
+    out=StreamEvent[]
+    hold=maximum(length, s.stops)-1
+    take!(count; cutting=false)=begin
+        while !isempty(s.held)
+            e=first(s.held)
+            if !is_text_event(e)
+                push!(out, popfirst!(s.held)); continue
+            end
+            t=e.delta.text
+            cutting && count==0 && break
+            if length(t)<=count
+                push!(out, popfirst!(s.held)); count-=length(t)
+            elseif cutting
+                scores, incomplete=scores_before_cut(e.delta.logprobs, t, count)
+                push!(out, reconstruct(e; delta=reconstruct(e.delta; text=String(first(t, count)), logprobs=scores,
+                    logprobs_complete=e.delta.logprobs_complete && !incomplete)))
+                break
+            else
+                break
+            end
+        end
+    end
+    for event in feed!(s.inner, frame)
+        if s.cut
+            is_text_event(event) || push!(out, event)
+            continue
+        end
+        if event isa Union{StreamEndEvent,StreamErrorEvent}
+            append!(out, s.held); empty!(s.held)
+            push!(out, event)
+            continue
+        end
+        if !is_text_event(event)
+            isempty(s.held) ? push!(out, event) : push!(s.held, event)
+            continue
+        end
+        push!(s.held, event)
+        buffered=join(e.delta.text for e in s.held if is_text_event(e))
+        hit=first_stop(buffered, s.stops)
+        if hit!==nothing
+            take!(length(buffered[1:prevind(buffered, hit)]); cutting=true)
+            empty!(s.held)
+            s.cut=true
+            continue
+        end
+        take!(max(0, length(buffered)-hold))
+    end
+    return out
 end
 
 """

@@ -425,6 +425,7 @@ function ingest_reasoning(body, c)
         "kimi"=>("thinking", "reasoning_effort"),
         "qwen"=>("enable_thinking",),
         "qwen_chat_template"=>("chat_template_kwargs",),
+        "reasoning_effort_switch"=>("reasoning_effort",),
         "none"=>(),
     )
     allowed=spellings[c.thinking_format]
@@ -435,8 +436,22 @@ function ingest_reasoning(body, c)
             unsupported("openai-chat", "reasoning spelling $key for this preset")
     end
     word=get(body, "reasoning_effort", nothing)
-    off=word=="none"
-    off && (word=nothing)
+    off=false
+    if word isa Bool
+        # The switch's spelling (reasoning_effort_switch; reasoning_off "switch"):
+        # false is off; true has no level to read back.
+        switch_spelled = c.thinking_format=="reasoning_effort_switch" ||
+            (c.thinking_format=="reasoning_effort" && c.reasoning_off=="switch")
+        switch_spelled || unsupported("openai-chat", "reasoning_effort = $(word) on a server whose reasoning_effort is a word")
+        word && unsupported("openai-chat", "reasoning_effort = true has no effort level")
+        off=true
+        word=nothing
+    else
+        word!==nothing && c.thinking_format=="reasoning_effort_switch" &&
+            unsupported("openai-chat", "reasoning_effort = '$(word)' on an on/off switch (true or false)")
+        off=word=="none"
+        off && (word=nothing)
+    end
     extra=obj()
     summary=nothing
     if haskey(body, "thinking")
@@ -618,6 +633,7 @@ function openai_chat_model_string(model::AbstractString; providers=())
     (length(bits)==1 || isempty(bits[2])) && return String(model)
     head=String(bits[1])
     provider=get(LITELLM_PROVIDER_PREFIXES, head, nothing)
+    provider===nothing && (provider=registry_alias(canonical_provider(head)))
     if provider===nothing
         canonical=canonical_provider(head)
         for d in providers

@@ -903,6 +903,95 @@
     "note": "Parasail open-model inference (Chat Completions dialect; serverless models)"
   },
   {
+    "id": "tinker",
+    "dialect": "openai-chat",
+    "access": {
+      "provider": "tinker",
+      "supports": {
+        "complete": true,
+        "stream": true,
+        "live": false,
+        "files": false,
+        "batches": false,
+        "images": false,
+        "speech": false,
+        "video": false,
+        "responses_api": false,
+        "models": true,
+        "caches": false,
+        "extra": []
+      },
+      "auth_modes": [
+        "bearer"
+      ],
+      "enterprise_variants": [],
+      "env_keys": [
+        "TINKER_API_KEY"
+      ],
+      "credential_policy": "key",
+      "auth_scheme": [
+        "bearer"
+      ],
+      "headers": [],
+      "host": null,
+      "login_hint": null,
+      "backend": "api",
+      "backend_options": {},
+      "system_prefix": null,
+      "base_url": "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
+      "backend_settings": []
+    },
+    "compat": "tinker",
+    "aliases": [
+      "thinkingmachines"
+    ],
+    "console_url": "https://tinker.thinkingmachines.ai/keys",
+    "note": "Tinker (Thinking Machines): base models and your own checkpoints (tinker://…, routed whole) over the Chat Completions wire (beta); reasoning_effort per base family; RouterConfig(base_models=...) names a checkpoint's base; no response_format; GET /models lists your sampler checkpoints with their base model"
+  },
+  {
+    "id": "tinker-anthropic",
+    "dialect": "anthropic",
+    "access": {
+      "provider": "tinker-anthropic",
+      "supports": {
+        "complete": true,
+        "stream": true,
+        "live": false,
+        "files": false,
+        "batches": false,
+        "images": false,
+        "speech": false,
+        "video": false,
+        "responses_api": false,
+        "models": false,
+        "caches": false,
+        "extra": []
+      },
+      "auth_modes": [
+        "x-api-key"
+      ],
+      "enterprise_variants": [],
+      "env_keys": [
+        "TINKER_API_KEY"
+      ],
+      "credential_policy": "key",
+      "auth_scheme": [
+        "x-api-key"
+      ],
+      "headers": [],
+      "host": null,
+      "login_hint": null,
+      "backend": "api",
+      "backend_options": {},
+      "system_prefix": null,
+      "base_url": "https://tinker.thinkingmachines.dev/services/tinker-prod/anthropic/api/v1",
+      "backend_settings": []
+    },
+    "compat": "tinker",
+    "console_url": "https://tinker.thinkingmachines.ai/keys",
+    "note": "Tinker over the Anthropic Messages wire (same TINKER_API_KEY, x-api-key; beta): output_config.effort; the Qwen, Kimi K2.6 and Nemotron families can neither turn reasoning off nor take an effort word here (use `tinker`); no output_config.format; no /models"
+  },
+  {
     "id": "meta",
     "dialect": "openai-responses",
     "access": {

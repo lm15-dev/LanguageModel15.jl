@@ -386,9 +386,17 @@ function openai_reasoning!(d, reasoning, c, l; chat=false)
     if format=="responses_reasoning"
         d["reasoning"]=obj("effort"=>word)
         !off && summary!==nothing && (d["reasoning"]["summary"]=summary)
+    elseif format=="reasoning_effort_switch"
+        # An on/off switch with no levels (Tinker's Qwen, Kimi K2.6, Nemotron):
+        # off is false; a level's nearest value is "on" (MAP-13).
+        off || adapt!("config.reasoning.effort", "substituted", "this model's reasoning is an on/off switch with no levels; reasoning was switched on"; asked=word, applied="on")
+        d["reasoning_effort"]=!off
     elseif format in ("reasoning_effort", "kimi")
         if format=="kimi" && off
             (d["thinking"]=obj("type"=>"disabled"))
+        elseif chat && format=="reasoning_effort" && off && c.reasoning_off=="switch"
+            # The switch's off where `none` is refused (Tinker's Qwen 3.8, DeepSeek V4.1).
+            (d["reasoning_effort"]=false)
         else
             (d["reasoning_effort"]=word)
         end
@@ -553,7 +561,11 @@ function openai_payload(l, r; stream=false, chat=false)
         tc.parallel===nothing || (d["parallel_tool_calls"]=tc.parallel)
     end
     if config.response_format!==nothing
-        if chat && c.json_schema=="reject" && config.response_format["type"]=="json_schema"
+        if chat && c.json_schema=="none"
+            # The server applies no response_format of either type and answers
+            # 200 with free text (Tinker, live 2026-11-09): MAP-8, never sent.
+            adapt!("config.response_format", "dropped", "this server accepts response_format type '$(config.response_format["type"])' and applies no response_format at all; describe the shape in the prompt"; asked=config.response_format)
+        elseif chat && c.json_schema=="reject" && config.response_format["type"]=="json_schema"
             adapt!("config.response_format", "dropped", "this server accepts response_format type 'json_schema' and does not apply it; use {'type': 'json_object'} and describe the shape in the prompt"; asked=config.response_format)
         else
             # MAP-14: the judgment convention goes verbatim (strict honours

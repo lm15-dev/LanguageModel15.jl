@@ -64,6 +64,11 @@
       "prefix": "jev-",
       "provider": "typesafe",
       "note": "TypeSafe Jev (live /v1/models listing 2026-09-17: jev-latest, jev-preview; versioned ids jev-1.13.0 accepted)"
+    },
+    {
+      "prefix": "tinker://",
+      "provider": "tinker",
+      "note": "a Tinker sampler checkpoint path (live /models listing 2026-11-09); a URI is one name, never provider:model"
     }
   ],
   "LITELLM_PROVIDER_PREFIXES": {
