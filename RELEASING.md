@@ -14,6 +14,9 @@ its fragments): `Pkg.test()` and the contract, 2,132 of 2,132.
 2.2.0 (2026-11-07) checked at contract `9d8e1ce` (MAP-7 rule 7 amended: Claude's thinking
 display): `Pkg.test()` and the contract, 2,140 of 2,140.
 
+2.3.0 (2026-11-10) checked at contract `18b3788` (Tinker on two doors; MAP-21, MAP-22,
+MAP-23): `Pkg.test()` and the contract, 2,266 of 2,266.
+
 The entries below record how the never-registered 1.0.0 was checked.
 
 Re-checked 2026-10-15 at contract `6dc1c5c`, when the pending registration moved to the

@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 2.3.0 — 2026-11-10
 
 Tinker (Thinking Machines): base models and the models you trained there
-(lm15-contract `18b3788`; to ratify).
+(lm15-contract `18b3788`; to ratify; 2,266 of 2,266 checks, the same as every lm15
+language).
 
 - **Two new providers, one key (`TINKER_API_KEY`):** `tinker` (Chat Completions, also
   spelled `thinkingmachines`) and `tinker-anthropic` (Messages). Both serve Tinker's base
