@@ -251,11 +251,8 @@ function build_cache_request(
         check_cache_prefix(prefix, ttl_seconds)
         model=startswith(prefix.model, "models/") ? prefix.model : "models/"*prefix.model
         d=obj("model"=>model, "contents"=>gemini_messages(l, prefix.messages))
-        prefix.system===nothing || (
-            d["systemInstruction"]=obj(
-                "parts"=>[obj("text"=>system_text(prefix.system; provider=l.provider))]
-            )
-        )
+        instruction=prefix.system===nothing ? nothing : gemini_system_instruction(prefix.system; provider=l.provider)
+        instruction===nothing || (d["systemInstruction"]=instruction)
         isempty(prefix.tools) || (d["tools"]=gemini_tools(prefix.tools))
         ttl_seconds===nothing || (d["ttl"]="$(integer_value(ttl_seconds))s")
         label===nothing || (d["displayName"]=label)

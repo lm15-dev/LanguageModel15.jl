@@ -68,12 +68,23 @@ function json_object(value)
         obj("partial_json"=>value)
     end
 end
+"""
+MAP-24: a wire block that is text with no characters, in the three typed spellings
+(Messages and Chat Completions `text`, Responses `input_text` / `output_text`). No wire is
+sent one: a part whose block is this writes nothing, and a message left with nothing is not
+written. (A Gemini part has no `type`; its builder decides.)
+"""
+empty_text_block(block) =
+    block isa AbstractDict &&
+    get(block, "type", nothing) in ("text", "input_text", "output_text") &&
+    get(block, "text", nothing) == ""
 function parts_to_text(parts; provider="", where="a text field")
     out=String[]
     for p in parts
         p isa MediaPart && unsupported(provider, "$(kind(p)) in $where")
         if p isa TextPart
-            push!(out, p.text)
+            # MAP-24: an empty text part writes nothing, a joining newline included.
+            isempty(p.text) || push!(out, p.text)
         elseif p isa ThinkingPart && !isempty(p.text)
             push!(out, p.text)
         elseif p isa CitationPart

@@ -15,11 +15,8 @@ function live_setup_frames(l::ProviderLM, c::LiveConfig)
             unsupported(l.provider, "live output audio format")
         model=startswith(c.model, "models/") ? c.model : "models/"*c.model
         setup=obj("model"=>model)
-        c.system===nothing || (
-            setup["systemInstruction"]=obj(
-                "parts"=>[obj("text"=>system_text(c.system; provider=l.provider))]
-            )
-        )
+        instruction=c.system===nothing ? nothing : gemini_system_instruction(c.system; provider=l.provider)
+        instruction===nothing || (setup["systemInstruction"]=instruction)
         isempty(c.tools) || (setup["tools"]=gemini_tools(c.tools))
         gen=obj()
         (c.output_format!==nothing || audio_native(c.model)) &&

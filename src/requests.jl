@@ -44,6 +44,9 @@ function chat_image(p::ImagePart, provider)
     return obj("type"=>"image_url", "image_url"=>d)
 end
 function chat_content(parts, provider; force_array=false)
+    # MAP-24: an empty text part writes nothing, so it does not turn a lone text part's
+    # string into the array form either.
+    parts=[p for p in parts if !(p isa TextPart && isempty(p.text))]
     length(parts)==1 && first(parts) isa TextPart && !force_array && return first(parts).text
     length(parts)==1 && first(parts) isa DataPart && !force_array && return data_part_text(first(parts))
     out=Any[]
@@ -67,20 +70,17 @@ function tool_output(p, c, provider; chat=false)
     end
     blocks=Any[]
     for part in p.content
-        push!(
-            blocks,
-            if chat
-                (
-                    if part isa ImagePart
-                        chat_image(part, provider)
-                    else
-                        obj("type"=>"text", "text"=>parts_to_text((part,); provider))
-                    end
-                )
+        block=if chat
+            if part isa ImagePart
+                chat_image(part, provider)
             else
-                openai_input(part, provider)
-            end,
-        )
+                obj("type"=>"text", "text"=>parts_to_text((part,); provider))
+            end
+        else
+            openai_input(part, provider)
+        end
+        # MAP-24: the result is written, its empty text block is not.
+        empty_text_block(block) || push!(blocks, block)
     end
     p.is_error && mark_error!(blocks, chat ? "text" : "input_text", "text")
     return blocks
@@ -221,7 +221,16 @@ function openai_messages(l, r, c; chat=false, boundary=breakpoint_index(r, c.cac
                         end,
                     )
                 elseif part isa TextPart
-                    push!(content, chat ? part.text : obj("type"=>"output_text", "text"=>part.text))
+                    # MAP-24: no empty text block, and no newline joining an empty text.
+                    isempty(part.text) ||
+                        push!(content, chat ? part.text : obj("type"=>"output_text", "text"=>part.text))
+                elseif part isa DataPart
+                    # An assistant data part (a judged answer kept in the history) is its
+                    # compact JSON on a text slot, as on every wire
+                    # (changes/2026-09-19-jev-state.md D3). It was refused here until
+                    # 2026-11-11.
+                    text=data_part_text(part)
+                    push!(content, chat ? text : obj("type"=>"output_text", "text"=>text))
                 elseif part isa RefusalPart
                     push!(content, chat ? part.text : obj("type"=>"refusal", "refusal"=>part.text))
                 elseif part isa ThinkingPart
@@ -248,9 +257,11 @@ function openai_messages(l, r, c; chat=false, boundary=breakpoint_index(r, c.cac
                         end
                     end
                 elseif part isa CitationPart
-                    unsupported(
-                        l.provider, "assistant citation replay has no native block on this wire"
-                    )
+                    # A citation annotates the text beside it, which is replayed; this
+                    # wire has no assistant slot for the annotation and the reference
+                    # writes none. (Refusing here made a reply with citations, as lm15
+                    # reads one, unsendable: found by the contract's history replay.)
+                    continue
                 else
                     unsupported(l.provider, "assistant $(kind(part)) replay")
                 end
@@ -264,6 +275,11 @@ function openai_messages(l, r, c; chat=false, boundary=breakpoint_index(r, c.cac
                     (!isempty(reasoning) || c.assistant_reasoning_content=="include_empty")
                     item["reasoning_content"]=join(filter(!isempty, reasoning), "\n")
                 end
+                # MAP-24: a row with no content, no call and no reasoning has nothing to
+                # write and is refused where the server checks ("content or tool_calls
+                # must be set", DeepSeek; "must not be empty", Moonshot; live 2026-11-11).
+                isempty(content) && isempty(calls) &&
+                    isempty(get(item, "reasoning_content", "")) && continue
                 push!(out, item)
             else
                 if !isempty(content)
@@ -279,9 +295,12 @@ function openai_messages(l, r, c; chat=false, boundary=breakpoint_index(r, c.cac
         content=if chat
             chat_content(msg.parts, l.provider; force_array=marked)
         else
-            [openai_input(p, l.provider) for p in msg.parts]
+            # MAP-24: a part whose block is empty text writes nothing.
+            [b for b in (openai_input(p, l.provider) for p in msg.parts) if !empty_text_block(b)]
         end
         marked && (last(content)["prompt_cache_breakpoint"]=obj("mode"=>"explicit"))
+        # MAP-24: a message with nothing to write is not written.
+        isempty(content) && continue
         push!(out, obj("role"=>role, "content"=>content))
     end
     return out
@@ -475,8 +494,9 @@ function openai_payload(l, r; stream=false, chat=false)
         d["stream"]=stream
     end
     chat && stream && c.stream_usage=="include" && (d["stream_options"]=obj("include_usage"=>true))
-    if r.system!==nothing
-        content=system_text(r.system; provider=l.provider)
+    # MAP-24: a system prompt with no characters writes nothing.
+    content=r.system===nothing ? "" : system_text(r.system; provider=l.provider)
+    if !isempty(content)
         stable=stable_prefix(r, c.cache_control)
         if chat || stable
             block=if stable
@@ -615,7 +635,7 @@ function anthropic_source(p::MediaPart)
     p.file_id!==nothing && return obj("type"=>"file", "file_id"=>p.file_id)
     return obj("type"=>"base64", "media_type"=>p.media_type, "data"=>media_base64(p))
 end
-function anthropic_part(l, p, c)
+function anthropic_part(l, p, c; in_result=false)
     p isa TextPart && return obj("type"=>"text", "text"=>p.text)
     p isa DataPart && return obj("type"=>"text", "text"=>data_part_text(p))
     p isa Union{ImagePart,DocumentPart} &&
@@ -625,8 +645,16 @@ function anthropic_part(l, p, c)
         return obj("type"=>"tool_use", "id"=>p.id, "name"=>p.name, "input"=>p.input)
     if p isa ToolResultPart
         check_result_media(l.provider, p, c.tool_result_media)
-        blocks=[anthropic_part(l, part, c) for part in p.content]
-        content=length(blocks)==1 && first(blocks)["type"]=="text" ? first(blocks)["text"] : blocks
+        # MAP-24: an empty text block is never written, in a result either; the result
+        # itself always is, and one with no other block keeps its empty output as "".
+        blocks=[b for b in (anthropic_part(l, part, c; in_result=true) for part in p.content) if !empty_text_block(b)]
+        content=if isempty(blocks)
+            ""
+        elseif length(blocks)==1 && first(blocks)["type"]=="text"
+            first(blocks)["text"]
+        else
+            blocks
+        end
         d=obj("type"=>"tool_result", "tool_use_id"=>p.id, "content"=>content)
         p.is_error && (d["is_error"]=true)
         return d
@@ -639,7 +667,14 @@ function anthropic_part(l, p, c)
         elseif c.thinking_replay=="unsigned" && !isempty(p.text)
             return obj("type"=>"thinking", "thinking"=>p.text)
         end
+        # No state this dialect consumes (none, or another dialect's: MAP-7 rule 8): the
+        # thinking is replayed as text. With no text this is an empty block, which the
+        # message builder leaves out (MAP-24).
         return obj("type"=>"text", "text"=>p.text)
+    elseif p isa CitationPart && !in_result
+        # A citation in a message replays as the text it quotes, as the reference does;
+        # one that quotes nothing is an empty block and is left out (MAP-24).
+        return obj("type"=>"text", "text"=>something(p.text, ""))
     end
     return obj("type"=>"text", "text"=>parts_to_text((p,); provider=l.provider))
 end
@@ -671,19 +706,23 @@ function anthropic_payload(l, r; stream=false)
     c.model_prefixes===nothing ||
         any(p->startswith(r.model, p), c.model_prefixes) ||
         throw(UnsupportedModelError("model would be silently substituted"; provider=l.provider))
+    # MAP-24: the Messages API refuses a text block with no characters (minLength 1;
+    # HTTP 400 "text content blocks must be non-empty", live 2026-11-11), so a part whose
+    # block is one writes nothing, and a message left with no block is not written
+    # (consecutive turns of one role are combined by the server). `written` keeps each
+    # wire message's place in the caller's list, for a cache mark asked for by index.
     messages=Any[]
-    for m in r.messages
+    written=Int[]
+    for (index, m) in enumerate(r.messages)
         blocks=if m.role=="developer"
-            [
-                obj(
-                    "type"=>"text",
-                    "text"=>"[developer]\n"*parts_to_text(m.parts; provider=l.provider),
-                ),
-            ]
+            text=parts_to_text(m.parts; provider=l.provider)
+            isempty(text) ? Any[] : Any[obj("type"=>"text", "text"=>"[developer]\n"*text)]
         else
-            [anthropic_part(l, p, c) for p in m.parts]
+            Any[b for b in (anthropic_part(l, p, c) for p in m.parts) if !empty_text_block(b)]
         end
+        isempty(blocks) && continue
         push!(messages, obj("role"=>m.role=="assistant" ? "assistant" : "user", "content"=>blocks))
+        push!(written, index-1)
     end
     # MAP-13: the Messages API cannot restrict to a subset of the declared tools;
     # only the allowed ones are sent, which is what the allowlist means.
@@ -760,15 +799,19 @@ function anthropic_payload(l, r; stream=false)
         cache.resource===nothing || refuse(l.provider, "config.cache.resource", "this server has no stored-cache tier; sending without it would drop the prompt prefix the resource holds")
     end
     if usecache
+        # The index names the caller's message; a message left out before it does not
+        # move the mark (MAP-24 rule 3).
         idx=if cache.prefix_until_index===nothing
             (cache.prefix=="history" ? length(messages)-1 : nothing)
         else
-            min(cache.prefix_until_index, length(messages)-1)
+            count(<=(min(cache.prefix_until_index, length(r.messages)-1)), written)-1
         end
-        idx===nothing || (last(messages[idx + 1]["content"])["cache_control"]=copy(marker))
+        idx===nothing || idx<0 ||
+            (last(messages[idx + 1]["content"])["cache_control"]=copy(marker))
     end
-    if r.system!==nothing
-        s=system_text(r.system; provider=l.provider)
+    # MAP-24: a system prompt with no characters writes nothing.
+    s=r.system===nothing ? "" : system_text(r.system; provider=l.provider)
+    if !isempty(s)
         d["system"]=usecache ? [obj("type"=>"text", "text"=>s, "cache_control"=>copy(marker))] : s
     end
     for name in (:temperature, :top_p, :top_k)
@@ -879,8 +922,13 @@ function gemini_part(l, p, names)
     elseif p isa ToolResultPart
         name=p.name===nothing ? get(names, p.id, nothing) : p.name
         name===nothing && unsupported(l.provider, "tool result without a known function name")
-        visible=Tuple(v for v in p.content if !(v isa MediaPart))
         media=[v for v in p.content if v isa MediaPart]
+        # MAP-24: beside media, an empty text part writes nothing (the media is the
+        # result); alone, it is the empty output and is written.
+        visible=Tuple(
+            v for v in p.content if
+            !(v isa MediaPart) && !(!isempty(media) && v isa TextPart && isempty(v.text))
+        )
         all(v->v isa Union{ImagePart,DocumentPart}, media) ||
             unsupported(l.provider, "this media kind in a function response")
         output=parts_to_text(visible; provider=l.provider)
@@ -898,6 +946,9 @@ function gemini_part(l, p, names)
         return obj("text"=>data_part_text(p))
     elseif p isa Union{TextPart,ThinkingPart}
         d=obj("text"=>p.text)
+    elseif p isa CitationPart
+        # A citation in a message replays as the text it quotes, as the reference does.
+        return obj("text"=>something(p.text, ""))
     else
         return obj("text"=>parts_to_text((p,); provider=l.provider))
     end
@@ -908,17 +959,30 @@ function gemini_part(l, p, names)
     end
     return d
 end
+# MAP-24 on this wire: a part that is only {"text": ""}. One that also carries a
+# thoughtSignature is state this dialect consumes and goes back as the model sent it.
+gemini_writes_nothing(part) =
+    get(part, "text", nothing) == "" && all(k->k in ("text", "thought"), keys(part))
+# `systemInstruction`, or nothing for a system prompt with no characters (MAP-24).
+function gemini_system_instruction(system; provider)
+    text=system_text(system; provider)
+    return isempty(text) ? nothing : obj("parts"=>[obj("text"=>text)])
+end
 function gemini_messages(l, messages; from=1)
     names=Dict{String,String}()
     out=Any[]
     for (index, m) in enumerate(messages)
         if index>=from
             parts=if m.role=="developer"
-                [obj("text"=>"[developer]\n"*parts_to_text(m.parts; provider=l.provider))]
+                text=parts_to_text(m.parts; provider=l.provider)
+                isempty(text) ? Any[] : Any[obj("text"=>"[developer]\n"*text)]
             else
-                [gemini_part(l, p, names) for p in m.parts]
+                Any[w for w in (gemini_part(l, p, names) for p in m.parts) if !gemini_writes_nothing(w)]
             end
-            push!(out, obj("role"=>m.role=="assistant" ? "model" : "user", "parts"=>parts))
+            # MAP-24: a content with no parts is refused ("must include at least one
+            # parts field", live 2026-11-11); a message with nothing to write is left out.
+            isempty(parts) ||
+                push!(out, obj("role"=>m.role=="assistant" ? "model" : "user", "parts"=>parts))
         end
         # Names come only from preceding turns, never future calls.
         for p in m.parts
@@ -1008,9 +1072,8 @@ function gemini_payload(l, r)
             "cachedContents/"*resource
         end
     elseif r.system!==nothing
-        d["systemInstruction"]=obj(
-            "parts"=>[obj("text"=>system_text(r.system; provider=l.provider))]
-        )
+        instruction=gemini_system_instruction(r.system; provider=l.provider)
+        instruction===nothing || (d["systemInstruction"]=instruction)
     end
     gen=obj()
     for (field, wire) in (
