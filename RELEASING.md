@@ -20,6 +20,9 @@ MAP-23): `Pkg.test()` and the contract, 2,266 of 2,266.
 2.3.1 (2026-11-11) checked at contract `81b519f` (MAP-24: a part with nothing for a
 wire writes nothing): `Pkg.test()` and the contract, 4,269 of 4,269.
 
+2.4.0 (2026-11-12) checked at contract `f67699c` (AUTH-1: a Google `external_account` with an AWS
+source): `Pkg.test()` and the contract, 4,271 of 4,271.
+
 The entries below record how the never-registered 1.0.0 was checked.
 
 Re-checked 2026-10-15 at contract `6dc1c5c`, when the pending registration moved to the
