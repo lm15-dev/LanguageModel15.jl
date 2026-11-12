@@ -89,6 +89,25 @@ function vet_response(r::Response)
     return out
 end
 function token_exchange_build(provider, rung, inputs, ctx::ChainContext)
+    info=get(inputs, "credential_file", nothing)
+    if rung in ("adc-env", "adc-file") && info isa AbstractDict && get(info, "type", nothing)=="external_account"
+        source=getobject(info, "credential_source")
+        haskey(source, "environment_id") ||
+            unsupported(provider, "deterministic token exchange for a non-AWS external_account")
+        credential, region=aws_environment(ctx), aws_env_region(ctx)
+        (credential===nothing || region===nothing) &&
+            unsupported(provider, "an AWS source's vector without its keys and region in env")
+        url, body=gcp_sts_request(
+            info, gcp_aws_subject_token(info, gcp_aws_source(source), region, credential, ctx.clock())
+        )
+        return obj(
+            "method"=>"POST",
+            "url"=>url,
+            "headers"=>obj("content-type"=>"application/json"),
+            "body_encoding"=>"json",
+            "body"=>body,
+        )
+    end
     if rung in ("adc-env", "adc-file", "service-account")
         url, assertion=gcp_assertion(
             ctx, inputs["credential_file"]; scope=get(inputs, "scope", GCP_SCOPE)

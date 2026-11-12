@@ -697,6 +697,118 @@ function gcp_impersonate(ctx, source, url, delegates=[])
     token===nothing && throw(AuthError("impersonation response has no access token"))
     return BearerToken(token; expires_at=normalized_time(get(data, "expireTime", nothing)))
 end
+# An external_account's AWS source (spec/auth.md AUTH-1 gcp-chain, amended 2026-11-12).
+"The verification URL of an AWS `credential_source`, checked as google-auth checks it."
+function gcp_aws_source(source)
+    m=match(r"^aws(\d+)$", string(something(get(source, "environment_id", nothing), "")))
+    url=string_field(source, "regional_cred_verification_url")
+    (m===nothing || url===nothing) && throw(
+        NotConfiguredError(
+            "an AWS credential_source needs environment_id \"aws1\" and regional_cred_verification_url",
+        ),
+    )
+    parse(Int, m.captures[1])==1 || throw(
+        NotConfiguredError("AWS credential_source version $(m.captures[1]) is not supported (only aws1)"),
+    )
+    return url
+end
+"IMDSv2's session header when the source names its token URL (google-auth: TTL 300), else none; asked for once."
+function gcp_aws_imds_session(ctx, source)
+    got=Ref{Union{Nothing,Dict{String,String}}}(nothing)
+    return function ()
+        if got[]===nothing
+            url=string_field(source, "imdsv2_session_token_url")
+            got[]=if url===nothing
+                Dict{String,String}()
+            else
+                status, _, raw=cloud_http(
+                    ctx, "PUT", url, Dict("X-aws-ec2-metadata-token-ttl-seconds"=>"300"); timeout=5
+                )
+                status==200 || throw(AuthError("AWS IMDSv2 session token: HTTP $status"))
+                Dict("X-aws-ec2-metadata-token"=>String(raw))
+            end
+        end
+        return got[]
+    end
+end
+"`AWS_REGION` or `AWS_DEFAULT_REGION`; nothing when neither is set."
+function aws_env_region(ctx)
+    for k in ("AWS_REGION", "AWS_DEFAULT_REGION")
+        v=get(ctx.env, k, "")
+        isempty(v) || return String(v)
+    end
+    return nothing
+end
+"The environment's region, else the source's `region_url` (an availability zone, its last letter dropped)."
+function gcp_aws_region(ctx, source, imds)
+    region=aws_env_region(ctx)
+    region===nothing || return region
+    url=string_field(source, "region_url")
+    url===nothing &&
+        throw(NotConfiguredError("no AWS region: set AWS_REGION (the AWS source names no region_url)"))
+    status, _, raw=cloud_http(ctx, "GET", url, imds(); timeout=5)
+    status==200 || throw(AuthError("AWS region from $url: HTTP $status"))
+    zone=strip(String(raw))
+    return String(zone[1:prevind(zone, lastindex(zone))])
+end
+"""
+The AWS identity an AWS source signs with: the environment's keys, then (an lm15 addition,
+stated: Google's library reads only the other two, and so fails on ECS) the container
+endpoint, then EC2 metadata at the source's `url`.
+"""
+function gcp_aws_credentials(ctx, source, imds)
+    env=aws_environment(ctx)
+    env===nothing || return env
+    if container_url(ctx)!==nothing
+        got=aws_container(ctx)
+        got===nothing || return got
+    end
+    url=string_field(source, "url")
+    url===nothing && throw(
+        NotConfiguredError(
+            "no AWS credentials: neither AWS_ACCESS_KEY_ID nor a container endpoint is set, and the AWS source names no metadata url",
+        ),
+    )
+    headers=imds()
+    status, _, role=cloud_http(ctx, "GET", url, headers; timeout=5)
+    name=strip(first(split(strip(String(role)), '\n'; limit=2)))
+    (status==200 && !isempty(name)) || throw(AuthError("AWS role name from $url: HTTP $status"))
+    status, _, raw=cloud_http(ctx, "GET", "$url/$name", headers; timeout=5)
+    status==200 || throw(AuthError("AWS credentials from $url/$name: HTTP $status"))
+    return aws_credential(JSON.parse(String(raw)))
+end
+"""
+An AWS source's subject token: a signed AWS STS GetCallerIdentity request, serialized as
+Google's STS reads it (google-auth aws.py: headers as `[{key, value}]` in signing order, the
+pool provider's name added unsigned as `x-goog-cloud-target-resource`, compact JSON with sorted
+keys, percent-encoded keeping `/`).
+"""
+function gcp_aws_subject_token(info, template, region, credential, now)
+    url=replace(template, "{region}"=>region)
+    host=HTTP.URI(url).host
+    signed=sigv4_sign("POST", url, Dict{String,String}(), UInt8[], credential, region, first(split(host, '.')); now=now)
+    headers=Any[
+        obj("key"=>"Authorization", "value"=>signed.authorization),
+        obj("key"=>"host", "value"=>signed.headers["host"]),
+        obj("key"=>"x-amz-date", "value"=>signed.headers["x-amz-date"]),
+    ]
+    credential.session_token===nothing ||
+        push!(headers, obj("key"=>"x-amz-security-token", "value"=>credential.session_token))
+    push!(headers, obj("key"=>"x-goog-cloud-target-resource", "value"=>string(info["audience"])))
+    return percent_encode(JSON.serialize(obj("headers"=>headers, "method"=>"POST", "url"=>url)); safe="/")
+end
+"The STS token exchange an external_account sends: its URL and JSON body."
+function gcp_sts_request(info, subject)
+    return get(info, "token_url", "https://sts.googleapis.com/v1/token"),
+    obj(
+        "grantType"=>"urn:ietf:params:oauth:grant-type:token-exchange",
+        "audience"=>info["audience"],
+        "scope"=>GCP_SCOPE,
+        "requestedTokenType"=>"urn:ietf:params:oauth:token-type:access_token",
+        "subjectToken"=>subject,
+        "subjectTokenType"=>info["subject_token_type"],
+    )
+end
 function gcp_info(ctx, info; depth=0)
     depth<16 || throw(NotConfiguredError("nested GCP credential sources are too deep"))
     type=get(info, "type", nothing)
@@ -746,12 +858,13 @@ function gcp_info(ctx, info; depth=0)
     source=getobject(info, "credential_source")
     format=getobject(source, "format")
     subject=nothing
-    haskey(source, "environment_id") && throw(
-        NotConfiguredError(
-            "GCP external account with AWS source is not implemented; supply an explicit bearer-token provider",
-        ),
-    )
-    if haskey(source, "file")
+    if haskey(source, "environment_id")
+        template=gcp_aws_source(source)
+        imds=gcp_aws_imds_session(ctx, source)
+        region=gcp_aws_region(ctx, source, imds)
+        subject=gcp_aws_subject_token(info, template, region, gcp_aws_credentials(ctx, source, imds), ctx.clock())
+        format=obj()
+    elseif haskey(source, "file")
         subject=cloud_read(ctx, source["file"])
     elseif haskey(source, "url")
         status, _, raw=cloud_http(
@@ -781,18 +894,8 @@ function gcp_info(ctx, info; depth=0)
         subject=string_field(JSON.parse(subject), get(format, "subject_token_field_name", ""))
         subject===nothing && throw(AuthError("subject token field is missing"))
     end
-    payload=obj(
-        "grantType"=>"urn:ietf:params:oauth:grant-type:token-exchange",
-        "audience"=>info["audience"],
-        "scope"=>GCP_SCOPE,
-        "requestedTokenType"=>"urn:ietf:params:oauth:token-type:access_token",
-        "subjectToken"=>subject,
-        "subjectTokenType"=>info["subject_token_type"],
-    )
-    token=oauth_credential(
-        cloud_exchange(ctx, get(info, "token_url", "https://sts.googleapis.com/v1/token"), payload),
-        ctx,
-    )
+    sts_url, payload=gcp_sts_request(info, subject)
+    token=oauth_credential(cloud_exchange(ctx, sts_url, payload), ctx)
     return if haskey(info, "service_account_impersonation_url")
         gcp_impersonate(ctx, token, info["service_account_impersonation_url"])
     else

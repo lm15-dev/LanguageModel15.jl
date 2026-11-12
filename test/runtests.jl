@@ -60,6 +60,7 @@ include("usage_one_meaning.jl")
 include("thinking_display.jl")
 include("empty_parts.jl")
 include("tinker.jl")
+include("gcp_aws_source.jl")
 
 @testset "aliases and errors" begin
     @test explain_auth("openai_chat"; env=Dict{String,String}()).provider == "openai-chat"
